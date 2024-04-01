@@ -658,16 +658,12 @@ class DeviceRegistry:
         self.all_usb_host_controllers = sorted(set(USBHostControllerDevice.enumerate_device()))
 
     @staticmethod
-    def get_cache_key(port_device, hub_device, usb_hub_port):
-        # The cache key includes the device instance identifier.
-        # But the instance identifier does not change when the device is reinserted.
-        # This causes the location field of the usb info not to be updated.
-        # So we also include some information about the hub device in the cache key.
-        return ' '.join([
-            port_device.instance_identifier.casefold(),
-            hub_device.instance_identifier.casefold(),
-            str(usb_hub_port)
-        ])
+    def get_cache_key(port_device, usb_device):
+        # The cache key includes the device instance identifier and its location
+        cache_key = port_device.instance_identifier.casefold()
+        if usb_device.location_paths:
+            cache_key += usb_device.location_paths[0].casefold()
+        return cache_key
 
     def get_location_string(self, usb_device, usb_host_controller, bConfigurationValue=None, bInterfaceNumber=None):
         # <bus>-<port[.port[.port]]>:<config>.<interface>
@@ -712,17 +708,17 @@ class DeviceRegistry:
             usb_interface_device = usb_device
             usb_device = parent_device
 
+        # Check for usb_info in cache.
+        if self.cache_usb_info:
+            cache_key = self.get_cache_key(port_device, usb_device)
+            if cache_key in self.usb_info_cache_dict:
+                return self.usb_info_cache_dict[cache_key]
+
         # Get the port number that the usb device is connected to.
         # https://learn.microsoft.com/en-us/windows-hardware/drivers/install/devpkey-device-address
         usb_hub_port = usb_device.address
         if usb_hub_port is None:
             return None
-
-        # Check for usb_info in cache.
-        if self.cache_usb_info:
-            cache_key = self.get_cache_key(port_device, hub_device, usb_hub_port)
-            if cache_key in self.usb_info_cache_dict:
-                return self.usb_info_cache_dict[cache_key]
 
         # Check the power status of the usb device.
         power_data = usb_device.power_data
