@@ -4,8 +4,9 @@
 # and hardware information.
 #
 # This file is part of pySerial. https://github.com/pyserial/pyserial
-# The original version is from Chris Liechti
-# This new version comes from Yu He
+# The original version is from Chris Liechti.
+# This new version addresses the issue of ListPortInfo being
+# inconsistent between Windows and POSIX systems.
 #
 # SPDX-License-Identifier:    BSD-3-Clause
 
@@ -659,16 +660,15 @@ class DeviceRegistry:
         self.all_usb_host_controllers = sorted(set(USBHostControllerDevice.enumerate_device()))
 
     @staticmethod
-    def get_cache_key(port_device, usb_device):
-        # The cache key includes the device instance identifier and its location.
-        # This ensures that the usb information is updated correctly when plugging in different devices,
-        # or when the same device is plugged into different USB ports.
-        cache_key = port_device.instance_identifier.casefold()
-        if usb_device.location_paths:
-            cache_key += usb_device.location_paths[0].casefold()
-        return cache_key
+    def get_cache_key(port_device):
+        # The cache key includes the device instance identifier,
+        # which will remain unchanged when the device is re-plugged.
+        return port_device.instance_identifier.casefold()
 
     def get_location_string(self, usb_device, usb_host_controller, bConfigurationValue=None, bInterfaceNumber=None):
+        # Generate location string compatible with linux usbfs.
+        # https://www.kernel.org/doc/Documentation/ABI/stable/sysfs-bus-usb
+        # <bus>-<port[.port[.port]]>:<config>.<interface>
         location_paths = usb_device.location_paths
         if not location_paths:
             return None
@@ -734,20 +734,8 @@ class DeviceRegistry:
             return None
         return usb_host_controller_device, hub_device, usb_device, usb_interface_device
 
-    def get_usb_info(self, port_device):
-        # Get parent host controller, hub, usb and interface recursively.
-        parents = self.find_parent_chain(port_device)
-        if parents is None:
-            return None
-        usb_host_controller_device, hub_device, usb_device, usb_interface_device = parents
-
-        # Check for usb_info in cache.
-        cache_key = None
-        if self.cache_usb_info:
-            cache_key = self.get_cache_key(port_device, usb_device)
-            if cache_key in self.usb_info_cache_dict:
-                return self.usb_info_cache_dict[cache_key]
-
+    @staticmethod
+    def request_usb_info(hub_device, usb_device, usb_interface_device, port_device):
         # Get the port number that the usb device is connected to.
         # https://learn.microsoft.com/en-us/windows-hardware/drivers/install/devpkey-device-address
         usb_hub_port = usb_device.address
@@ -851,18 +839,37 @@ class DeviceRegistry:
                             language_id
                         )
 
-        # Generate location string compatible with linux usbfs.
-        # https://www.kernel.org/doc/Documentation/ABI/stable/sysfs-bus-usb
-        # <bus>-<port[.port[.port]]>:<config>.<interface>
-        location = self.get_location_string(
+        return USBInfo(vid, pid, manufacturer, product, serial_number, bConfigurationValue, bInterfaceNumber, function, interface)
+
+    def get_usb_info(self, port_device):
+        # Get parent host controller, hub, usb and interface recursively.
+        parents = self.find_parent_chain(port_device)
+        if parents is None:
+            return None
+        usb_host_controller_device, hub_device, usb_device, usb_interface_device = parents
+
+        # Generate cache key
+        cache_key = None
+        if self.cache_usb_info:
+            cache_key = self.get_cache_key(port_device)
+
+        # Check for usb_info in cache.
+        if cache_key in self.usb_info_cache_dict:
+            usb_info = self.usb_info_cache_dict[cache_key]
+        else:
+            # No cached USBInfo, request usb info once
+            usb_info = self.request_usb_info(hub_device, usb_device, usb_interface_device, port_device)
+            if usb_info is None:
+                return None
+
+        # When the same USB device is plugged into different USB ports, Windows recognizes it as the same device.
+        # This behavior differs from other operating systems. Therefore, the location string needs to be updated.
+        usb_info.location = self.get_location_string(
             usb_device,
             usb_host_controller_device,
-            bConfigurationValue,
-            bInterfaceNumber
+            usb_info.configuration_value,
+            usb_info.interface_number
         )
-
-        # Gather all usb information into USBInfo object
-        usb_info = USBInfo(pid, vid, product, manufacturer, serial_number, location, function, interface)
 
         # Cache usb info.
         if cache_key is not None:
@@ -1200,20 +1207,22 @@ class USBHubDeviceIOControl:
 class USBInfo:
     """Simple class to hold usb information"""
 
-    __slots__ = 'pid', 'vid', 'product', 'manufacturer', 'serial_number', 'location', 'function', 'interface'
+    __slots__ = ('vid', 'pid', 'manufacturer', 'product', 'serial_number', 'configuration_value', 'interface_number', 'function', 'interface', 'location')
 
-    def __init__(self, pid, vid, product, manufacturer, serial_number, location, function, interface):
-        self.pid = pid
+    def __init__(self, vid=None, pid=None, manufacturer=None, product=None, serial_number=None, configuration_value=None, interface_number=None, function=None, interface=None, location=None):
         self.vid = vid
-        self.product = product
+        self.pid = pid
         self.manufacturer = manufacturer
+        self.product = product
         self.serial_number = serial_number
-        self.location = location
+        self.configuration_value = configuration_value
+        self.interface_number = interface_number
         # Function string is not generally available on different platforms.
         # However, the function string may be useful in distinguishing between
         # different serial ports of the same device. So we decided to keep it.
         self.function = function
         self.interface = interface
+        self.location = location
 
 
 def iterate_comports(cache_usb_info=True):
@@ -1255,6 +1264,7 @@ def iterate_comports(cache_usb_info=True):
             info.manufacturer = usb_info.manufacturer
             info.serial_number = usb_info.serial_number
             info.location = usb_info.location
+            # info.function = usb_info.function
             info.interface = usb_info.interface
             info.apply_usb_info()
         yield info
