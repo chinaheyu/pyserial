@@ -314,11 +314,33 @@ CM_Open_DevNode_Key.argtypes = [
 ]
 CM_Open_DevNode_Key.restype = ctypes.c_uint32
 
+CM_Get_Device_ID_List_SizeW = ctypes.windll.cfgmgr32.CM_Get_Device_ID_List_SizeW
+CM_Get_Device_ID_List_SizeW.argtypes = [
+    ctypes.POINTER(ctypes.c_ulong),
+    ctypes.c_wchar_p,
+    ctypes.c_ulong
+]
+CM_Get_Device_ID_List_SizeW.restype = ctypes.c_uint32
+
+CM_Get_Device_ID_ListW = ctypes.windll.cfgmgr32.CM_Get_Device_ID_ListW
+CM_Get_Device_ID_ListW.argtypes = [
+    ctypes.c_wchar_p,
+    ctypes.c_wchar_p,
+    ctypes.c_ulong,
+    ctypes.c_ulong
+]
+CM_Get_Device_ID_ListW.restype = ctypes.c_uint32
+
 GUID_DEVINTERFACE_USB_HUB = GUID(0xf18a0e88, 0xc30c, 0x11d0, (0x88, 0x15, 0x00, 0xa0, 0xc9, 0x06, 0xbe, 0xd8))
 GUID_DEVINTERFACE_COMPORT = GUID(0X86E0D1E0, 0X8089, 0X11D0, (0X9C, 0XE4, 0X08, 0X00, 0X3E, 0X30, 0X1F, 0X73))
 GUID_DEVINTERFACE_MODEM = GUID(0x2c7089aa, 0x2e0e, 0x11d1, (0xb1, 0x14, 0x00, 0xc0, 0x4f, 0xc2, 0xaa, 0xe4))
 GUID_DEVINTERFACE_USB_HOST_CONTROLLER = GUID(0x3abf6f2d, 0x71c4, 0x462a, (0x8a, 0x92, 0x1e, 0x68, 0x61, 0xe6, 0xaf, 0x27))
 
+GUID_DEVCLASS_PORTS = GUID(0x4d36e978, 0xe325, 0x11ce, (0xbf, 0xc1, 0x08, 0x00, 0x2b, 0xe1, 0x03, 0x18))
+GUID_DEVCLASS_MODEM = GUID(0x4d36e96d, 0xe325, 0x11ce, (0xbf, 0xc1, 0x08, 0x00, 0x2b, 0xe1, 0x03, 0x18))
+
+CM_GETIDLIST_FILTER_PRESENT = 0x00000100
+CM_GETIDLIST_FILTER_CLASS = 0x00000200
 CM_GET_DEVICE_INTERFACE_LIST_PRESENT = 0
 CM_LOCATE_DEVNODE_NORMAL = 0
 CR_SUCCESS = 0
@@ -637,6 +659,59 @@ class PortDevice(DeviceInterface):
             0
         )
         CloseHandle(port_handle)
+
+
+class LegacyPortDevice(DeviceNode):
+    # With versions prior to Windows 10, the Port device was not an interface after Zadig set the driver to usbser.sys.
+    # This class is only intended for some devices that are port class but not interface.
+
+    def wake_up_device(self):
+        port_handle = CreateFileW(
+            '\\\\.\\' + self.port_name,
+            GENERIC_READ | GENERIC_WRITE,
+            0,
+            None,
+            OPEN_EXISTING,
+            FILE_ATTRIBUTE_NORMAL,
+            0
+        )
+        CloseHandle(port_handle)
+
+    @classmethod
+    def enumerate_device(cls):
+        # Repeat for all possible GUIDs.
+        for guid in (GUID_DEVCLASS_PORTS, GUID_DEVCLASS_MODEM):
+            # Get the size of the interface list.
+            device_list_size = ctypes.c_uint32()
+            cr = CM_Get_Device_ID_List_SizeW(
+                ctypes.byref(device_list_size),
+                str(guid),
+                CM_GETIDLIST_FILTER_CLASS | CM_GETIDLIST_FILTER_PRESENT
+            )
+            if cr != CR_SUCCESS:
+                raise ctypes.WinError(CM_MapCrToWin32Err(cr, 0))
+            if device_list_size.value > 1:
+                # Get all devices
+                device_list = ctypes.create_unicode_buffer(device_list_size.value)
+                cr = CM_Get_Device_ID_ListW(
+                    str(guid),
+                    device_list,
+                    ctypes.sizeof(device_list),
+                    CM_GETIDLIST_FILTER_CLASS | CM_GETIDLIST_FILTER_PRESENT
+                )
+                if cr != CR_SUCCESS:
+                    raise ctypes.WinError(CM_MapCrToWin32Err(cr, 0))
+                null_terminated_list = ctypes.wstring_at(device_list, device_list_size.value)
+                for instance_identifier in null_terminated_list.rstrip('\0').split('\0'):
+                    instance_handle = ctypes.c_uint32()
+                    cr = CM_Locate_DevNodeW(
+                        ctypes.byref(instance_handle),
+                        instance_identifier,
+                        CM_LOCATE_DEVNODE_NORMAL
+                    )
+                    if cr != CR_SUCCESS:
+                        continue
+                    yield cls(instance_handle.value)
 
 
 class USBHostControllerDevice(DeviceInterface):
@@ -1233,7 +1308,7 @@ def iterate_comports(cache_usb_info=True):
     yielded_devices = []
 
     # Iterate through each serial device.
-    for port_device in PortDevice.enumerate_device():
+    for port_device in [p for g in [PortDevice.enumerate_device(), LegacyPortDevice.enumerate_device()] for p in g]:
         if port_device in yielded_devices:
             # Skip repeated serial device.
             continue
@@ -1278,5 +1353,15 @@ def comports(include_links=False):
 # - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - - -
 # test
 if __name__ == '__main__':
-    for port, desc, hwid in sorted(comports()):
-        print("{}: {} [{}]".format(port, desc, hwid))
+    for info in sorted(comports()):
+        print(f'device: {info.device}')
+        print(f'name: {info.name}')
+        print(f'description: {info.description}')
+        print(f'hwid: {info.hwid}')
+        print(f'vid: {info.vid:04X}')
+        print(f'pid: {info.pid:04X}')
+        print(f'serial_number: {info.serial_number}')
+        print(f'location: {info.location}')
+        print(f'manufacturer: {info.manufacturer}')
+        print(f'product: {info.product}')
+        print(f'interface: {info.interface}')
